@@ -14,6 +14,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -75,7 +76,7 @@ func (s *Server) NewModelRun() {
 func (s *Server) Requests() []Request {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]Request(nil), s.requests...)
+	return slices.Clone(s.requests)
 }
 
 // Client calls the fake in memory, without a network connection, so inside a synctest test the fake runs on

@@ -1,6 +1,7 @@
 package forecast
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -86,7 +87,7 @@ func (c *Cache) acquire(ctx context.Context, p geo.Point) (permit, error) {
 		}
 	}
 	if ok, err := c.store.lease(ctx, keyLease(p), now, now.Add(leaseTTL)); err != nil || !ok {
-		return permit{}, cmpErr(err, errLeaseHeld)
+		return permit{}, cmp.Or[error](err, errLeaseHeld)
 	}
 	return permit{probe: forbidden}, nil
 }
@@ -97,31 +98,24 @@ func (c *Cache) spend(ctx context.Context, p geo.Point, pm permit, known bool) e
 	now := time.Now()
 	if ok, err := c.store.takeToken(ctx, now, known); err != nil || !ok {
 		c.release(ctx, p)
-		return cmpErr(err, unavailable(http.StatusServiceUnavailable, budgetRetryAfter, "no upstream budget left"))
+		return cmp.Or[error](err, unavailable(http.StatusServiceUnavailable, budgetRetryAfter, "no upstream budget left"))
 	}
 	if pm.probe {
 		if ok, err := c.store.lease(ctx, keyProbe, now, now.Add(leaseTTL)); err != nil || !ok {
 			c.release(ctx, p)
-			return cmpErr(err, unavailable(http.StatusServiceUnavailable, probeRetryAfter, "calls to met.no are paused"))
+			return cmp.Or[error](err, unavailable(http.StatusServiceUnavailable, probeRetryAfter, "calls to met.no are paused"))
 		}
 		// A probe that failed meanwhile set a new pause before it released the probe lease.
 		pausedUntil, err := c.getTime(ctx, keyPause)
 		if err != nil || now.Before(pausedUntil) {
 			_ = c.store.del(ctx, keyLease(p), keyProbe)
-			return cmpErr(err, unavailable(http.StatusServiceUnavailable, pausedUntil.Sub(now), "calls to met.no are paused"))
+			return cmp.Or[error](err, unavailable(http.StatusServiceUnavailable, pausedUntil.Sub(now), "calls to met.no are paused"))
 		}
 	}
 	return nil
 }
 
 func (c *Cache) release(ctx context.Context, p geo.Point) { _ = c.store.del(ctx, keyLease(p)) }
-
-func cmpErr(err, otherwise error) error {
-	if err != nil {
-		return err
-	}
-	return otherwise
-}
 
 // report records the result of a call made with permit, and returns how long to wait before trying again.
 // maxBackoff caps a per-location backoff, so a location with servable data is retried before its deadline.
