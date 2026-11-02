@@ -484,11 +484,48 @@ npx @openapitools/openapi-generator-cli generate -i openapi.yaml -g kotlin -o cl
   format small floating-point numbers with an exponent (e.g. `5e-05`), which would be rejected.
 - Check the spec with `npx @redocly/cli lint openapi.yaml`.
 
+## Production and operations
+How the service is meant to run in production. Nothing here is set up yet; it is the plan to discuss.
+
+**Running the instances**
+- The container image runs on any container platform: at least 3 instances spread over availability zones, so a deploy or the
+  loss of a zone never takes the weather down. Adding instances adds capacity for phones, not traffic towards met.no.
+- `/readyz` is the readiness check and `/healthz` the liveness check (see [Health checks](#health-checks)).
+- Rolling deploys replace one instance at a time. On `SIGTERM` an instance fails `/readyz`, finishes running requests, cancels
+  met.no calls and exits within 20 seconds, so the platform's grace period must be longer than that. The cache lives in Redis,
+  so deploys don't empty it.
+- Each instance needs little: about 0.1 CPU and 64 MB at the expected ~80 req/s across all instances.
+
+**Redis**
+- A managed Redis (or Valkey) with a replica and automatic failover, in the same region as the instances. A Redis outage makes
+  `upcoming` and `live` requests fail closed, so its availability matters more than its size.
+- About 4 KB per location, so 36 000 locations take roughly 150 MB.
+- `maxmemory-policy noeviction`. Evicting keys could drop a pause or the budget, which would break the met.no rules; with
+  `noeviction` a full Redis makes writes fail, and the service fails closed instead. Alert on memory use well before that.
+- Password and TLS through the URL (`rediss://user:password@host:6380`), with the URL from the platform's secret store.
+
+**Environments**
+- Each environment has its own Redis. Staging runs against the fake met.no, or with `-upstream-rate 1`, because every
+  environment counts towards the same 20 req/s per application (see [Upstream budget](#upstream-budget)).
+- The production User-Agent names the service and a team address, not a person, e.g.
+  `how-is-the-weather-at-api/1.0 weather-team@example.com`.
+
+**Security**
+- TLS ends at the load balancer. Only the instances can reach Redis, and the only outbound traffic they need is to
+  `api.met.no`.
+
+**Build and deploy**
+- Every pull request runs `make lint` and `make test`. Merges to `main` build the image, tagged with the commit, deploy it to
+  staging and then to production. Rolling back means deploying the previous image.
+
+**Observability**
+- Logs are JSON on stderr, ready for the platform's log collection.
+- Metrics and alerts are the next step (see [Further work](#further-work--considerations)). The alerts that matter most: met.no
+  `403` (blocked) and `203` (deprecated version), Redis unreachable, the rate of `503` responses, and upstream budget usage.
+
 ## Further work & considerations
 
 Deliberately left out for now:
-- **An in-memory cache in front of Redis.** At ~80 req/s Redis answers in about a millisecond, and a second cache layer would
-  raise the question of which copy is the latest.
 - **Falling back to per-instance state when Redis is down.** Rejected; see [Shared state](#shared-state).
 - **Trusted event data.** Events come from the client unverified. The long-term fix is to look events up in an authoritative
   source, or to have the system that hands events to the app sign them so we can verify the signature.
