@@ -1,0 +1,39 @@
+# Build output
+/bin/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test output: binaries from go test -c, coverage profiles, CPU and memory profiles
+*.test
+*.out
+*.prof
+coverage.*
+*.coverprofile
+
+# Go workspace files, for local multi-module setups
+go.work
+go.work.sum
+
+# Dependency directory, if go mod vendor is used locally
+/vendor/
+
+# Generated API clients (see "OpenAPI specification" in the README)
+/clients/
+
+# Environment and secrets
+.env
+.env.*
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Claude Code: personal settings (the shared .claude/settings.json is kept)
+.claude/settings.local.json

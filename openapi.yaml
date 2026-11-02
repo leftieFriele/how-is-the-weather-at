@@ -1,0 +1,304 @@
+openapi: 3.0.3
+info:
+  title: How is the weather at API
+  version: 1.0.0
+  description: |
+    Weather forecasts for events: air temperature in Celsius and wind speed in m/s, based on the
+    met.no Locationforecast API.
+
+    - Forecasts are shown for events that start within the next 7 days.
+    - Weather data is never more than 2 hours older than the last time met.no confirmed it.
+    - All times in responses are UTC.
+
+    Data from MET Norway, licensed under CC BY 4.0. Clients must show the `attribution` text
+    from the response.
+  license:
+    name: Weather data CC BY 4.0 (MET Norway)
+    url: https://creativecommons.org/licenses/by/4.0/
+servers:
+  - url: http://localhost:8080
+    description: Local development
+security: []  # No authentication yet. Events come from the client unverified.
+paths:
+  /events/{eventId}/weather:
+    get:
+      operationId: getEventWeather
+      summary: Get the weather forecast for an event
+      description: |
+        The content depends on the event's phase at the time of the request:
+
+        | Phase | When | `current` | `forecast` |
+        |---|---|---|---|
+        | `forecast_pending` | `start` is more than 7 days away | `null` | `[]`, `available_from` is set |
+        | `upcoming` | `start` is within the next 7 days | weather now | entries around the event |
+        | `live` | between `start` and `end` | weather now | entries from now until `end` |
+        | `ended` | after `end` | `null` | `[]` |
+
+        `forecast` holds the forecast steps inside the event plus the nearest step before and after it.
+        met.no has hourly steps for about the first 2.5 days and 6-hourly steps after that.
+
+        Duplicated query parameters are rejected with `400`.
+      parameters:
+        - name: eventId
+          in: path
+          required: true
+          description: The event's identifier.
+          schema:
+            type: string
+            pattern: '^[A-Za-z0-9_-]{1,64}$'
+          example: abc123
+        - name: lat
+          in: query
+          required: true
+          description: |
+            Latitude in decimal degrees, -90 to 90. Truncated to 4 decimals by the server.
+            Sent as a string because the value must be a plain decimal number: exponents
+            (`5.99e1`), hex, `NaN` and `Inf` are rejected, and many languages format small
+            floating-point numbers with an exponent.
+          schema:
+            type: string
+            pattern: '^-?[0-9]{1,2}(\.[0-9]+)?$'
+          example: '59.9139'
+        - name: lon
+          in: query
+          required: true
+          description: |
+            Longitude in decimal degrees, -180 to 180. Truncated to 4 decimals by the server.
+            Sent as a string for the same reason as `lat`.
+          schema:
+            type: string
+            pattern: '^-?[0-9]{1,3}(\.[0-9]+)?$'
+          example: '10.7522'
+        - name: start
+          in: query
+          required: true
+          description: Event start, RFC 3339 with offset.
+          schema:
+            type: string
+            format: date-time
+          example: '2026-11-05T18:00:00+01:00'
+        - name: end
+          in: query
+          required: true
+          description: Event end, RFC 3339 with offset. Must be after `start`, at most 14 days later.
+          schema:
+            type: string
+            format: date-time
+          example: '2026-11-05T23:00:00+01:00'
+      responses:
+        '200':
+          description: |
+            The event's weather. `forecast_pending` and `ended` events also return `200`,
+            with `current: null` and `forecast: []`.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/CacheControl'
+            Link:
+              description: Link to the CC BY 4.0 license of the weather data.
+              schema:
+                type: string
+              example: '<https://creativecommons.org/licenses/by/4.0/>; rel="license"'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WeatherResponse'
+              examples:
+                upcoming:
+                  summary: Upcoming event, 6-hourly forecast steps
+                  value:
+                    event_id: abc123
+                    phase: upcoming
+                    location: { lat: 59.9139, lon: 10.7522 }
+                    current: { time: '2026-11-02T09:00:00Z', air_temperature_celsius: 4.2, wind_speed_mps: 3.1 }
+                    forecast:
+                      - { time: '2026-11-05T12:00:00Z', air_temperature_celsius: 2.1, wind_speed_mps: 4.8 }
+                      - { time: '2026-11-05T18:00:00Z', air_temperature_celsius: 1.0, wind_speed_mps: 5.4 }
+                      - { time: '2026-11-06T00:00:00Z', air_temperature_celsius: -0.6, wind_speed_mps: 5.9 }
+                    available_from: null
+                    fetched_at: '2026-11-02T08:47:12Z'
+                    attribution: &attribution >-
+                      Based on data from MET Norway (api.met.no), licensed under CC BY 4.0
+                      (https://creativecommons.org/licenses/by/4.0/). Values extracted and simplified.
+                forecast_pending:
+                  summary: Event more than 7 days away
+                  value:
+                    event_id: def456
+                    phase: forecast_pending
+                    location: { lat: 60.3913, lon: 5.3221 }
+                    current: null
+                    forecast: []
+                    available_from: '2026-11-13T18:00:00Z'
+                    fetched_at: null
+                    attribution: *attribution
+                ended:
+                  summary: Ended event
+                  value:
+                    event_id: ghi789
+                    phase: ended
+                    location: { lat: 63.4305, lon: 10.395 }
+                    current: null
+                    forecast: []
+                    available_from: null
+                    fetched_at: null
+                    attribution: *attribution
+        '400':
+          description: Invalid input.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: 'lat: must be a plain decimal number'
+        '502':
+          description: |
+            No weather data younger than 2 hours, and met.no failed for this location, now or
+            recently. `Retry-After` is set when the location is in backoff.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            Retry-After:
+              $ref: '#/components/headers/RetryAfter'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: |
+            No weather data younger than 2 hours, and met.no can't be called right now: no upstream
+            budget was free, all calls to met.no are paused, met.no's `Expires` hasn't passed yet, or the
+            met.no call didn't finish within 3 seconds.
+            Retry after `Retry-After` seconds, plus a small random delay.
+          headers:
+            Cache-Control:
+              $ref: '#/components/headers/NoStore'
+            Retry-After:
+              $ref: '#/components/headers/RetryAfter'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+components:
+  headers:
+    CacheControl:
+      description: |
+        `public, max-age=N, stale-while-revalidate=S`. A cached copy never outlives the 2-hour limit
+        or the event's next phase change.
+      schema:
+        type: string
+      example: public, max-age=1200, stale-while-revalidate=300
+    NoStore:
+      description: Error responses must not be cached.
+      schema:
+        type: string
+        enum: [no-store]
+    RetryAfter:
+      description: Seconds to wait before retrying.
+      schema:
+        type: integer
+        minimum: 1
+      example: 1
+  schemas:
+    WeatherResponse:
+      type: object
+      additionalProperties: false
+      required: [event_id, phase, location, current, forecast, available_from, fetched_at, attribution]
+      properties:
+        event_id:
+          type: string
+          description: The eventId from the request.
+        phase:
+          $ref: '#/components/schemas/Phase'
+        location:
+          $ref: '#/components/schemas/Location'
+        current:
+          # Same fields as WeatherPoint. OpenAPI 3.0 can't combine a $ref with nullable, so they are repeated here.
+          type: object
+          nullable: true
+          additionalProperties: false
+          required: [time, air_temperature_celsius, wind_speed_mps]
+          description: Weather at the location right now. `null` unless the phase is `upcoming` or `live`.
+          properties:
+            time:
+              type: string
+              format: date-time
+              description: Time of the forecast step, UTC.
+            air_temperature_celsius:
+              type: number
+              format: double
+              description: Air temperature in degrees Celsius.
+            wind_speed_mps:
+              type: number
+              format: double
+              minimum: 0
+              description: Wind speed in metres per second.
+        forecast:
+          type: array
+          items:
+            $ref: '#/components/schemas/WeatherPoint'
+          description: Forecast steps around the event, ordered by time. Empty unless the phase is `upcoming` or `live`.
+        available_from:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the forecast becomes available (`start` minus 7 days). Only set for `forecast_pending`.
+        fetched_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: When met.no last confirmed the weather data. `null` when no met.no data was needed.
+        attribution:
+          type: string
+          description: Credit text for the weather data. Clients must show it.
+    Phase:
+      type: string
+      enum: [forecast_pending, upcoming, live, ended]
+      description: |
+        - `forecast_pending`: `start` is more than 7 days away.
+        - `upcoming`: `start` is within the next 7 days.
+        - `live`: between `start` and `end`.
+        - `ended`: after `end`.
+    Location:
+      type: object
+      additionalProperties: false
+      required: [lat, lon]
+      description: The coordinates used, truncated to 4 decimals.
+      properties:
+        lat:
+          type: number
+          format: double
+          minimum: -90
+          maximum: 90
+        lon:
+          type: number
+          format: double
+          minimum: -180
+          maximum: 180
+    WeatherPoint:
+      type: object
+      additionalProperties: false
+      required: [time, air_temperature_celsius, wind_speed_mps]
+      properties:
+        time:
+          type: string
+          format: date-time
+          description: Time of the forecast step, UTC.
+        air_temperature_celsius:
+          type: number
+          format: double
+          description: Air temperature in degrees Celsius.
+        wind_speed_mps:
+          type: number
+          format: double
+          minimum: 0
+          description: Wind speed in metres per second.
+    Error:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: What went wrong, in plain English.

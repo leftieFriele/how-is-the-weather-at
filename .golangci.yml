@@ -1,0 +1,9 @@
+version: "2"
+
+linters:
+  enable:
+    - bodyclose # the met.no client must close response bodies
+    - errorlint # wrapped errors are checked with errors.Is / errors.AsType
+    - modernize # newer Go idioms, as in the /use-modern-go guidelines
+    - noctx # HTTP requests must carry a context
+    - sloglint # consistent log/slog calls
