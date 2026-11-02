@@ -255,6 +255,33 @@ state in Redis.
   for the same location share one upstream call, and errors from met.no pause or slow down our calls
   (see [Talking to met.no](#talking-to-metno)).
 
+### Components
+Inside one instance. Solid lines are the production path; the dotted line is `-in-memory`, for tests and local runs.
+
+```mermaid
+flowchart LR
+    app([Phone app]) -->|"GET /events/{id}/weather"| api
+
+    subgraph instance["how-is-the-weather-at-api (one instance)"]
+        api["api<br/>HTTP handlers, Cache-Control"]
+        event["event<br/>input validation, phase"]
+        geo["geo<br/>coordinates, 4 decimals"]
+        forecast["forecast.Cache<br/>freshness, single-flight,<br/>budget, pauses, backoff"]
+        store{{"forecast.Store"}}
+        metno["metno<br/>Locationforecast client"]
+
+        api --> event
+        event --> geo
+        api -->|Get| forecast
+        forecast --> store
+        forecast -->|Get, If-Modified-Since| metno
+    end
+
+    store -->|RedisStore| redis[(Redis<br/>shared state)]
+    store -.->|MemoryStore<br/>single instance| mem[(in-process LRU)]
+    metno -->|HTTPS| metnoapi([api.met.no])
+```
+
 ## Request flow
 1. **Validate the input** (see [Input parameters](#input-parameters)). Invalid requests get `400`.
 2. **Decide the event's phase** from `start`, `end` and the current time (see [API response](#api-response)).
