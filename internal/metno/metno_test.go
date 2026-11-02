@@ -3,9 +3,11 @@ package metno_test
 import (
 	"errors"
 	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -151,6 +153,37 @@ func TestMetnoClient(t *testing.T) {
 		// Then
 		if e, ok := errors.AsType[*metno.UpstreamError](err); !ok || e.Status != 0 {
 			t.Errorf("err = %v, want UpstreamError without status", err)
+		}
+	})
+
+	t.Run("reuses the connection to met.no after an error response", func(t *testing.T) {
+		// Given met.no answers 500 with a body larger than what Go reads by itself when a body is closed
+		var mu sync.Mutex
+		conns := 0
+		srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, strings.Repeat("x", 1<<20), http.StatusInternalServerError)
+		}))
+		srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+			if state == http.StateNew {
+				mu.Lock()
+				conns++
+				mu.Unlock()
+			}
+		}
+		srv.Start()
+		t.Cleanup(srv.Close)
+		c, _ := metno.NewClient(srv.Client(), srv.URL, userAgent)
+
+		// When
+		for range 3 {
+			_, _ = c.Get(t.Context(), oslo, "")
+		}
+
+		// Then
+		mu.Lock()
+		defer mu.Unlock()
+		if conns != 1 {
+			t.Errorf("connections = %d, want 1", conns)
 		}
 	})
 }

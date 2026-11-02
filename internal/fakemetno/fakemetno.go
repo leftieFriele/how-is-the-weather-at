@@ -23,6 +23,7 @@ import (
 const DefaultExpiresIn = 30 * time.Minute
 
 type Request struct {
+	Time            time.Time
 	Lat             string
 	Lon             string
 	UserAgent       string
@@ -106,6 +107,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	lat, lon := q.Get("lat"), q.Get("lon")
 	s.mu.Lock()
 	s.requests = append(s.requests, Request{
+		Time:            time.Now(),
 		Lat:             lat,
 		Lon:             lon,
 		UserAgent:       r.Header.Get("User-Agent"),

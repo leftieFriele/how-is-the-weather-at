@@ -130,7 +130,11 @@ func (c *Client) Get(ctx context.Context, p geo.Point, lastModified string) (For
 		}
 		return Forecast{}, &UpstreamError{Err: err}
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer func() {
+		// Read what is left, so the connection to met.no can be reused.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodySize))
+		_ = resp.Body.Close()
+	}()
 
 	switch status := resp.StatusCode; {
 	case status == http.StatusOK || status == http.StatusNonAuthoritativeInfo:

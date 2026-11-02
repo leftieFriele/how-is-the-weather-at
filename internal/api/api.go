@@ -31,6 +31,8 @@ const (
 
 type Forecaster interface {
 	Get(ctx context.Context, p geo.Point) (forecast.Data, error)
+	// Ready fails when no forecast can be served, e.g. because the shared state is unreachable.
+	Ready(ctx context.Context) error
 }
 
 type Server struct {
@@ -56,10 +58,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.Serve
 // ShuttingDown makes /readyz fail, so the load balancer stops sending traffic.
 func (s *Server) ShuttingDown() { s.ready.Store(false) }
 
-// readyz stays healthy during a met.no pause: cached data can still be served. It fails only when shutting down.
-func (s *Server) readyz(w http.ResponseWriter, _ *http.Request) {
+// readyz stays healthy during a met.no pause: cached data can still be served. It fails when shutting down, and
+// when this instance can't reach the shared state, so the load balancer sends traffic to instances that can.
+func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
 	if !s.ready.Load() {
 		writeText(w, http.StatusServiceUnavailable, "shutting down")
+		return
+	}
+	if err := s.forecasts.Ready(r.Context()); err != nil {
+		writeText(w, http.StatusServiceUnavailable, "shared state unavailable")
 		return
 	}
 	writeText(w, http.StatusOK, "ok")

@@ -3,6 +3,7 @@ package api_test
 import (
 	"context"
 	"encoding/json/v2"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -18,15 +19,18 @@ import (
 )
 
 type stubForecasts struct {
-	data  forecast.Data
-	err   error
-	calls int
+	data     forecast.Data
+	err      error
+	calls    int
+	notReady error
 }
 
 func (s *stubForecasts) Get(context.Context, geo.Point) (forecast.Data, error) {
 	s.calls++
 	return s.data, s.err
 }
+
+func (s *stubForecasts) Ready(context.Context) error { return s.notReady }
 
 // Like met.no: hourly for 60 hours, then 6-hourly up to 9 days.
 func steps() []metno.Step {
@@ -281,6 +285,51 @@ func TestWeatherRequest(t *testing.T) {
 		// Then
 		if rec.Code != http.StatusMethodNotAllowed {
 			t.Errorf("status = %d, want 405", rec.Code)
+		}
+	})
+}
+
+func TestHealthChecks(t *testing.T) {
+	check := func(t *testing.T, s *api.Server, path string) int {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, path, nil))
+		return rec.Code
+	}
+
+	t.Run("is ready while the shared state can be reached", func(t *testing.T) {
+		// Given
+		s := api.New(&stubForecasts{}, slog.New(slog.DiscardHandler))
+
+		// Then
+		if got := check(t, s, "/readyz"); got != http.StatusOK {
+			t.Errorf("/readyz = %d, want 200", got)
+		}
+	})
+
+	t.Run("is not ready when the shared state can't be reached, but stays alive", func(t *testing.T) {
+		// Given
+		s := api.New(&stubForecasts{notReady: errors.New("connection refused")}, slog.New(slog.DiscardHandler))
+
+		// Then
+		if got := check(t, s, "/readyz"); got != http.StatusServiceUnavailable {
+			t.Errorf("/readyz = %d, want 503", got)
+		}
+		if got := check(t, s, "/healthz"); got != http.StatusOK {
+			t.Errorf("/healthz = %d, want 200", got)
+		}
+	})
+
+	t.Run("is not ready once shutdown has started", func(t *testing.T) {
+		// Given
+		s := api.New(&stubForecasts{}, slog.New(slog.DiscardHandler))
+
+		// When
+		s.ShuttingDown()
+
+		// Then
+		if got := check(t, s, "/readyz"); got != http.StatusServiceUnavailable {
+			t.Errorf("/readyz = %d, want 503", got)
 		}
 	})
 }

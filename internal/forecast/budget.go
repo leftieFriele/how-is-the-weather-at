@@ -6,6 +6,11 @@ import (
 )
 
 const (
+	// MetnoRateLimit is met.no's limit per application, in requests per second.
+	MetnoRateLimit = 20
+	// MaxRate is the highest refill rate that keeps a full bucket plus a second of refills within MetnoRateLimit.
+	MaxRate = MetnoRateLimit - budgetCapacity
+
 	// With a rate of 10/s, at most 5 + 10 = 15 calls fit in any second, safely under met.no's 20 req/s.
 	budgetCapacity     = 5
 	newLocationReserve = 2

@@ -2,20 +2,21 @@
 //
 // It enforces the freshness rule (data is never served more than 2 hours after met.no last confirmed it), the
 // met.no Terms of Service (never call before Expires, stay within the upstream budget, back off on errors) and
-// makes concurrent requests for the same location share one met.no call.
+// makes concurrent requests for the same location share one met.no call. With a RedisStore these rules hold across
+// all instances.
 package forecast
 
 import (
 	"context"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
-
-	"github.com/hashicorp/golang-lru/v2/simplelru"
 
 	"how-is-the-weather-at-api/internal/geo"
 	"how-is-the-weather-at-api/internal/metno"
@@ -27,13 +28,21 @@ const (
 	// How long clients may cache data while a refresh is due.
 	RefreshingFreshFor = 60 * time.Second
 
-	upstreamTimeout   = 10 * time.Second
-	waitTimeout       = 3 * time.Second
-	refreshJitter     = 60 * time.Second
-	backoffMin        = 30 * time.Second
-	backoffMax        = 5 * time.Minute
-	deprecatedLogEach = time.Hour
-	budgetRetryAfter  = time.Second
+	upstreamTimeout = 10 * time.Second
+	waitTimeout     = 3 * time.Second
+	// How often a request checks whether another instance has fetched the location it waits for.
+	pollInterval  = 100 * time.Millisecond
+	refreshJitter = 60 * time.Second
+	// Guards against an Expires that is already past, e.g. through clock skew, which would otherwise make every
+	// request refresh unchanged data.
+	minRefreshInterval = time.Minute
+	backoffMin         = 30 * time.Second
+	backoffMax         = 5 * time.Minute
+	deprecatedLogEach  = time.Hour
+	budgetRetryAfter   = time.Second
+	storeRetryAfter    = 5 * time.Second
+	// For recording a call's result after the call itself has used up its context.
+	storeTimeout = time.Second
 )
 
 var (
@@ -46,7 +55,7 @@ type Fetcher interface {
 }
 
 type Data struct {
-	// Ordered by time. Shared, so must not be modified.
+	// Ordered by time.
 	Steps []metno.Step
 	// The last 200 or 304 from met.no.
 	ValidatedAt time.Time
@@ -73,33 +82,30 @@ func unavailable(status int, retryAfter time.Duration, reason string) *Unavailab
 
 type Config struct {
 	Fetcher Fetcher
-	Budget  *Budget
-	Size    int
+	Store   Store
 	Logger  *slog.Logger
 }
 
 type Cache struct {
-	fetcher Fetcher
-	budget  *Budget
-	log     *slog.Logger
-	ctx     context.Context // server lifetime; met.no calls run on it, not on the request's context
-	wg      sync.WaitGroup
+	fetcher   Fetcher
+	store     Store
+	log       *slog.Logger
+	ctx       context.Context // server lifetime; met.no calls run on it, not on the request's context
+	wg        sync.WaitGroup
+	storeDown atomic.Bool
 
-	mu                 sync.Mutex
-	entries            *simplelru.LRU[geo.Point, *entry]
-	inflight           map[geo.Point]*call
-	gate               gate
-	deprecatedLoggedAt time.Time
+	mu sync.Mutex
+	// Calls in progress in this instance. Across instances, a lease in the store does the same.
+	inflight map[geo.Point]*call
 }
 
+// entry is how a forecast is kept in the store.
 type entry struct {
-	steps        []metno.Step // nil until the first successful fetch
-	validatedAt  time.Time
-	expires      time.Time
-	refreshAfter time.Time // expires plus jitter, so refreshes are spread out
-	lastModified string
-	backoffUntil time.Time
-	backoffNext  time.Duration
+	Steps        []metno.Step
+	ValidatedAt  time.Time
+	Expires      time.Time
+	RefreshAfter time.Time // Expires plus jitter, so refreshes are spread out
+	LastModified string
 }
 
 // done is closed once data or err is set.
@@ -110,86 +116,57 @@ type call struct {
 }
 
 // Cancelling ctx cancels all met.no calls; Wait then waits for them to end.
-func New(ctx context.Context, cfg Config) (*Cache, error) {
-	entries, err := simplelru.NewLRU[geo.Point, *entry](cfg.Size, nil)
-	if err != nil {
-		return nil, fmt.Errorf("forecast: %w", err)
-	}
+func New(ctx context.Context, cfg Config) *Cache {
 	return &Cache{
 		fetcher:  cfg.Fetcher,
-		budget:   cfg.Budget,
+		store:    cfg.Store,
 		log:      cfg.Logger,
 		ctx:      ctx,
-		entries:  entries,
 		inflight: make(map[geo.Point]*call),
-	}, nil
+	}
 }
 
 // Cancel the context given to New first.
 func (c *Cache) Wait() { c.wg.Wait() }
 
+// Ready fails when the store can't be reached, since then no forecast can be served.
+func (c *Cache) Ready(ctx context.Context) error { return c.store.ping(ctx) }
+
 // Get returns the forecast for p. If there is none younger than 2 hours, it fetches one and waits for it, at most
 // 3 seconds. Errors are *UnavailableError.
 func (c *Cache) Get(ctx context.Context, p geo.Point) (Data, error) {
-	c.mu.Lock()
 	now := time.Now()
-	e, _ := c.entries.Get(p)
-	if e.usable(now) {
-		if !now.Before(e.refreshAfter) && !now.Before(e.backoffUntil) {
-			// Refresh in the background; this request is served from the cache either way.
-			if _, err := c.startLocked(now, p, e); err != nil {
-				c.log.Debug("background refresh skipped", locationAttr(p), slog.Any("reason", err))
-			}
-		}
-		d := e.data(now)
-		c.mu.Unlock()
-		return d, nil
-	}
-	cl, err := c.fetchLocked(now, p, e)
-	c.mu.Unlock()
+	e, err := c.load(ctx, p)
 	if err != nil {
-		return Data{}, err
+		return Data{}, c.storeUnavailable(err)
 	}
-	return wait(ctx, cl)
+	if e.usable(now) {
+		if !now.Before(e.RefreshAfter) {
+			c.start(p, e) // refresh in the background; this request is served from the cache either way
+		}
+		return e.data(now), nil
+	}
+	return wait(ctx, c.start(p, e))
 }
 
-// c.mu must be held.
-func (c *Cache) fetchLocked(now time.Time, p geo.Point, e *entry) (*call, error) {
+// start returns this instance's call for p, starting one if none is running.
+func (c *Cache) start(p geo.Point, prev *entry) *call {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if cl := c.inflight[p]; cl != nil {
-		return cl, nil
-	}
-	if e != nil && now.Before(e.backoffUntil) {
-		return nil, unavailable(http.StatusBadGateway, e.backoffUntil.Sub(now), "met.no failed for this location recently")
-	}
-	if e.hasData() && now.Before(e.expires) {
-		// The data is past its 2-hour deadline, but the Terms of Service forbid calling met.no before Expires.
-		c.log.Warn("location unavailable: met.no Expires is later than the 2-hour deadline",
-			locationAttr(p), slog.Time("expires", e.expires))
-		return nil, unavailable(http.StatusServiceUnavailable, e.expires.Sub(now), "met.no's Expires has not passed")
-	}
-	return c.startLocked(now, p, e)
-}
-
-// Joins a call already running for p. Fails if calls are paused or the budget has no token. c.mu must be held.
-func (c *Cache) startLocked(now time.Time, p geo.Point, e *entry) (*call, error) {
-	if cl := c.inflight[p]; cl != nil {
-		return cl, nil
-	}
-	if ok, retryAfter := c.gate.allow(now); !ok {
-		return nil, unavailable(http.StatusServiceUnavailable, retryAfter, "calls to met.no are paused")
-	}
-	known := e.hasData()
-	if !c.budget.TryTake(known) {
-		return nil, unavailable(http.StatusServiceUnavailable, budgetRetryAfter, "no upstream budget left")
-	}
-	lastModified := ""
-	if known {
-		lastModified = e.lastModified
+		return cl
 	}
 	cl := &call{done: make(chan struct{})}
 	c.inflight[p] = cl
-	c.wg.Go(func() { c.run(p, lastModified, cl) })
-	return cl, nil
+	c.wg.Go(func() {
+		data, err := c.fetch(p, prev)
+		c.mu.Lock()
+		delete(c.inflight, p)
+		c.mu.Unlock()
+		cl.data, cl.err = data, err
+		close(cl.done)
+	})
+	return cl
 }
 
 // If the wait times out first, the call keeps running and fills the cache.
@@ -204,95 +181,198 @@ func wait(ctx context.Context, cl *call) (Data, error) {
 	}
 }
 
-func (c *Cache) run(p geo.Point, lastModified string, cl *call) {
+// fetch calls met.no for p if the rules allow it, and returns what waiting requests get.
+func (c *Cache) fetch(p geo.Point, prev *entry) (Data, error) {
 	ctx, cancel := context.WithTimeoutCause(c.ctx, upstreamTimeout, errUpstreamTimeout)
 	defer cancel()
-	f, err := c.fetcher.Get(ctx, p, lastModified)
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	now := time.Now()
-	e, ok := c.entries.Get(p)
-	if !ok {
-		e = &entry{}
-		c.entries.Add(p, e)
+	known := prev.hasData()
+	if known && !prev.usable(now) && now.Before(prev.Expires) {
+		// The data is past its 2-hour deadline, but the Terms of Service forbid calling met.no before Expires.
+		if c.once(ctx, "expires:"+keyForecast(p), prev.Expires.Sub(now)) {
+			c.log.Warn("location unavailable: met.no Expires is later than the 2-hour deadline",
+				locationAttr(p), slog.Time("expires", prev.Expires))
+		}
+		return Data{}, unavailable(http.StatusServiceUnavailable, prev.Expires.Sub(now), "met.no's Expires has not passed")
 	}
-	cl.data, cl.err = c.storeLocked(now, p, e, f, err)
-	delete(c.inflight, p)
-	close(cl.done)
+
+	pm, err := c.acquire(ctx, p)
+	if errors.Is(err, errLeaseHeld) {
+		if prev.usable(now) {
+			return prev.data(now), nil
+		}
+		return c.awaitOther(ctx, p)
+	}
+	if err == nil {
+		// Another call may have refreshed p since it was loaded.
+		if cur, lerr := c.load(ctx, p); lerr == nil && cur.usable(now) && !now.Before(cur.ValidatedAt) &&
+			(prev == nil || cur.ValidatedAt.After(prev.ValidatedAt)) {
+			c.release(ctx, p)
+			return cur.data(now), nil
+		}
+		err = c.spend(ctx, p, pm, known)
+	}
+	if err != nil {
+		if prev.usable(now) {
+			return prev.data(now), nil
+		}
+		if u, ok := errors.AsType[*UnavailableError](err); ok {
+			return Data{}, u
+		}
+		return Data{}, c.storeUnavailable(err)
+	}
+
+	lastModified := ""
+	if known {
+		lastModified = prev.LastModified
+	}
+	f, err := c.fetcher.Get(ctx, p, lastModified)
+	return c.complete(p, prev, pm, f, err)
 }
 
-// Returns what waiting requests get. c.mu must be held.
-func (c *Cache) storeLocked(now time.Time, p geo.Point, e *entry, f metno.Forecast, err error) (Data, error) {
-	if err == nil && f.NotModified && !e.hasData() {
-		// The entry was evicted while the call ran, so there is nothing to keep.
-		err = &metno.UpstreamError{Status: http.StatusNotModified, Err: errors.New("not modified, but nothing cached")}
-	}
-	c.gate.report(now, err)
+// complete records the result of a met.no call.
+func (c *Cache) complete(p geo.Point, prev *entry, pm permit, f metno.Forecast, err error) (Data, error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.ctx), storeTimeout)
+	defer cancel()
+	now := time.Now()
 
 	if err == nil {
-		if !f.NotModified {
-			e.steps = f.Steps
+		e := &entry{Steps: f.Steps, ValidatedAt: now, Expires: f.Expires, LastModified: f.LastModified}
+		if f.NotModified {
+			e.Steps = prev.Steps
 		}
-		e.validatedAt = now
-		e.expires = f.Expires
-		e.refreshAfter = f.Expires.Add(rand.N(refreshJitter))
-		e.lastModified = f.LastModified
-		e.backoffUntil, e.backoffNext = time.Time{}, 0
-		if f.Deprecated && now.Sub(c.deprecatedLoggedAt) >= deprecatedLogEach {
-			c.deprecatedLoggedAt = now
+		refreshAfter := f.Expires
+		if earliest := now.Add(minRefreshInterval); refreshAfter.Before(earliest) {
+			refreshAfter = earliest
+		}
+		e.RefreshAfter = refreshAfter.Add(rand.N(refreshJitter))
+		if serr := c.save(ctx, p, e); serr != nil {
+			_ = c.storeUnavailable(serr) // the data itself is fine to serve
+		}
+		if _, serr := c.report(ctx, p, pm, nil, 0); serr != nil {
+			_ = c.storeUnavailable(serr)
+		}
+		if f.Deprecated && c.once(ctx, "deprecated", deprecatedLogEach) {
 			c.log.Warn("met.no says this product version is deprecated (203); migrate to a newer version")
 		}
 		return e.data(now), nil
 	}
 
+	maxBackoff := backoffMax
+	if prev.usable(now) {
+		maxBackoff = min(backoffMax, prev.deadline().Sub(now)/2)
+	}
+	retryAfter, serr := c.report(ctx, p, pm, err, maxBackoff)
+	if serr != nil {
+		_ = c.storeUnavailable(serr)
+	}
+
 	var fail *UnavailableError
 	if _, ok := errors.AsType[*metno.ThrottledError](err); ok {
 		c.log.Warn("met.no throttled us (429); pausing all calls", slog.Any("error", err))
-		fail = unavailable(http.StatusServiceUnavailable, c.gate.wait(now), "met.no asked us to back off")
+		fail = unavailable(http.StatusServiceUnavailable, retryAfter, "met.no asked us to back off")
 	} else if _, ok := errors.AsType[*metno.ForbiddenError](err); ok {
 		c.log.Error("met.no refused our request (403); pausing all calls, a human must check this", slog.Any("error", err))
-		fail = unavailable(http.StatusServiceUnavailable, c.gate.wait(now), "calls to met.no are paused")
+		fail = unavailable(http.StatusServiceUnavailable, retryAfter, "calls to met.no are paused")
 	} else if _, ok := errors.AsType[*metno.ClientError](err); ok {
 		c.log.Error("met.no rejected our request", locationAttr(p), slog.Any("error", err))
-		e.backOff(now, backoffMax)
-		fail = unavailable(http.StatusBadGateway, e.backoffUntil.Sub(now), "met.no rejected the request")
+		fail = unavailable(http.StatusBadGateway, retryAfter, "met.no rejected the request")
 	} else {
 		c.log.Warn("met.no call failed", locationAttr(p), slog.Any("error", err))
-		d := max(e.backoffNext, backoffMin)
-		e.backoffNext = min(2*d, backoffMax)
-		e.backOff(now, min(d+rand.N(d/5), backoffMax))
-		fail = unavailable(http.StatusBadGateway, e.backoffUntil.Sub(now), "met.no failed")
+		fail = unavailable(http.StatusBadGateway, retryAfter, "met.no failed")
 	}
 
 	// Data younger than 2 hours is still served.
-	if e.usable(now) {
-		return e.data(now), nil
+	if prev.usable(now) {
+		return prev.data(now), nil
 	}
 	return Data{}, fail
 }
 
-func (e *entry) hasData() bool { return e != nil && e.steps != nil }
+// awaitOther waits for another call, possibly on another instance, to fetch p.
+func (c *Cache) awaitOther(ctx context.Context, p geo.Point) (Data, error) {
+	ctx, cancel := context.WithTimeoutCause(ctx, waitTimeout, errWaitTimeout)
+	defer cancel()
+	for {
+		select {
+		case <-time.After(pollInterval):
+		case <-ctx.Done():
+			return Data{}, unavailable(http.StatusServiceUnavailable, time.Second, "a met.no call for this location is still in progress")
+		}
+		now := time.Now()
+		e, err := c.load(ctx, p)
+		if err != nil {
+			return Data{}, c.storeUnavailable(err)
+		}
+		if e.usable(now) {
+			return e.data(now), nil
+		}
+		heldUntil, err := c.getTime(ctx, keyLease(p))
+		if err != nil {
+			return Data{}, c.storeUnavailable(err)
+		}
+		if !now.Before(heldUntil) {
+			// The other call ended without usable data, so it failed.
+			b, _ := c.getBackoff(ctx, p)
+			return Data{}, unavailable(http.StatusBadGateway, max(b.until.Sub(now), 0), "met.no failed")
+		}
+	}
+}
 
-func (e *entry) deadline() time.Time { return e.validatedAt.Add(MaxAge) }
+func (c *Cache) load(ctx context.Context, p geo.Point) (*entry, error) {
+	v, ok, err := c.store.get(ctx, keyForecast(p))
+	if err != nil {
+		return nil, err
+	}
+	if c.storeDown.CompareAndSwap(true, false) {
+		c.log.Info("shared state is reachable again")
+	}
+	if !ok {
+		return nil, nil
+	}
+	var e entry
+	if err := json.Unmarshal([]byte(v), &e); err != nil {
+		c.log.Warn("ignoring an unreadable cached forecast", locationAttr(p), slog.Any("error", err))
+		return nil, nil
+	}
+	return &e, nil
+}
+
+func (c *Cache) save(ctx context.Context, p geo.Point, e *entry) error {
+	b, err := json.Marshal(e)
+	if err != nil {
+		return err
+	}
+	// Keep the forecast as long as it may be served or decides when met.no may be called again.
+	keep := e.deadline()
+	for _, t := range []time.Time{e.Expires, e.RefreshAfter} {
+		if t.After(keep) {
+			keep = t
+		}
+	}
+	return c.store.set(ctx, keyForecast(p), string(b), time.Until(keep)+time.Minute)
+}
+
+// storeUnavailable fails closed: without the shared state, no rule can be checked.
+func (c *Cache) storeUnavailable(err error) error {
+	if c.storeDown.CompareAndSwap(false, true) {
+		c.log.Error("shared state is unreachable; failing closed", slog.Any("error", err))
+	}
+	return unavailable(http.StatusServiceUnavailable, storeRetryAfter, "shared state unavailable")
+}
+
+func (e *entry) hasData() bool { return e != nil && e.Steps != nil }
+
+func (e *entry) deadline() time.Time { return e.ValidatedAt.Add(MaxAge) }
 
 func (e *entry) usable(now time.Time) bool { return e.hasData() && now.Before(e.deadline()) }
 
 func (e *entry) data(now time.Time) Data {
 	freshFor := RefreshingFreshFor
-	if now.Before(e.expires) {
-		freshFor = e.expires.Sub(now)
+	if now.Before(e.Expires) {
+		freshFor = e.Expires.Sub(now)
 	}
-	return Data{Steps: e.steps, ValidatedAt: e.validatedAt, Deadline: e.deadline(), FreshFor: freshFor}
-}
-
-// While the entry still has data that may be served, the backoff ends halfway to the deadline at the latest,
-// so at least one retry happens before it.
-func (e *entry) backOff(now time.Time, d time.Duration) {
-	if e.usable(now) {
-		d = min(d, e.deadline().Sub(now)/2)
-	}
-	e.backoffUntil = now.Add(d)
+	return Data{Steps: e.Steps, ValidatedAt: e.ValidatedAt, Deadline: e.deadline(), FreshFor: freshFor}
 }
 
 func locationAttr(p geo.Point) slog.Attr {

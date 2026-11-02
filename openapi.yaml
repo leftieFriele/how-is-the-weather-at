@@ -168,8 +168,8 @@ paths:
         '503':
           description: |
             No weather data younger than 2 hours, and met.no can't be called right now: no upstream
-            budget was free, all calls to met.no are paused, met.no's `Expires` hasn't passed yet, or the
-            met.no call didn't finish within 3 seconds.
+            budget was free, all calls to met.no are paused, met.no's `Expires` hasn't passed yet, the
+            met.no call didn't finish within 3 seconds, or the service's shared state (Redis) can't be reached.
             Retry after `Retry-After` seconds, plus a small random delay.
           headers:
             Cache-Control:
